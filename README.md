@@ -34,13 +34,13 @@ pip install sinica
 Here is how you can profile a dataset in under 10 seconds:
 ```python
 import pandas as pd
-from sinica import DataProfiler
+from sinica import ProfileReport
 
 # 1. Load your DataFrame
-df = your_data_frame 
+df = your_data_frame
 
-# 2. Instantiate the DataProfiler
-pr = DataProfiler(df)
+# 2. Instantiate the ProfileReport
+pr = ProfileReport(df)
 
 # 3. Generate a statistical summary
 summary_df = pr.summary()
