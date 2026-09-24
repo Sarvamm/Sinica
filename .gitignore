@@ -1,0 +1,11 @@
+# Build & Distribution outputs
+dist/
+build/
+*.egg-info/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Local IDE settings
+.vscode/

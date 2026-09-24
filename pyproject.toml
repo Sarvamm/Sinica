@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sinica"  # Rename to your preferred unique package name
+version = "0.1.0"
+authors = [
+  { name="sarvamm", email="srvmrtr@gmail.com" },
+]
+description = "A pandas DataFrame profiling tool for statistical summaries and quality alerts."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pandas>=1.2.0",
+    "numpy>=1.20.0",
+    "scipy>=1.6.0"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/sarvamm/seneca"
