@@ -34,7 +34,7 @@ pip install sinica
 Here is how you can profile a dataset in under 10 seconds:
 ```python
 import pandas as pd
-from sinica import ProfileReport
+from sinica.core import ProfileReport
 
 # 1. Load your DataFrame
 df = your_data_frame
