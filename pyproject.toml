@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sinica"  # Rename to your preferred unique package name
-version = "0.1.0"
+version = "0.1.2"
 authors = [
   { name="sarvamm", email="srvmrtr@gmail.com" },
 ]
@@ -21,6 +21,8 @@ dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.6.0"
 ]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.urls]
 "Homepage" = "https://github.com/sarvamm/seneca"
