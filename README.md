@@ -51,3 +51,13 @@ alerts_df = pr.alerts()
 print(alerts_df)
 ```
 
+## Column-level analysis
+
+Use `ProfileReport.univ` to display detailed statistics and plots for a column.
+Pass an explicit type: `"numeric"`, `"text"`, `"date"`, or `"categorical"`.
+Aliases such as `"num"`, `"str"`, `"datetime"`, and `"category"` are also accepted.
+
+```python
+pr.univ("age", "numeric")
+pr.univ("comment", "text")
+```

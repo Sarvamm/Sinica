@@ -9,3 +9,6 @@ __pycache__/
 
 # Local IDE settings
 .vscode/
+testing.ipynb
+data.csv
+functions_to_add.py
