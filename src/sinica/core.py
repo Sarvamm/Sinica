@@ -1,29 +1,125 @@
+"""Polars + Plotly port of ``ProfileReport``.
+
+A small, data-profiling-style tool for profiling and summarising Polars
+DataFrames inside Jupyter notebooks.
+
+Requirements (polars >= 1.0 recommended)::
+
+    pip install polars plotly numpy scipy tqdm wordcloud ipython nbformat
+
+Usage::
+
+    report = ProfileReport(df)          # polars DataFrame/LazyFrame or pandas DataFrame
+    report                              # (last line of a cell) renders the overview
+    report.get_alerts()                 # alerts as a polars DataFrame
+    report.univ("price", "numeric")     # per-column deep dive
+
+Missing-value semantics
+-----------------------
+Polars distinguishes ``null`` from ``NaN``; pandas does not. To keep the
+behaviour of the original report, *both* are treated as missing for float
+columns.
+"""
+
+from __future__ import annotations
+
+import math
 import re
 import unicodedata
 from collections import Counter
 
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import seaborn as sns
+import plotly.graph_objects as go
+import polars as pl
+import polars.selectors as cs
 from IPython.display import Markdown, display
-from pandas import DataFrame
+from plotly.subplots import make_subplots
 from scipy import stats
 from tqdm import tqdm
 from wordcloud import WordCloud
 
+try:  # pandas is optional; only needed to accept pandas DataFrames
+    import pandas as pd
+except ImportError:  # pragma: no cover
+    pd = None
+
+
+# --------------------------------------------------------------------------- #
+# Small module-level helpers
+# --------------------------------------------------------------------------- #
+def _format_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024**2:
+        return f"{n / 1024:.1f} KiB"
+    return f"{n / 1024**2:.1f} MiB"
+
+
+def _num(x) -> float:
+    """Polars returns ``None`` for undefined stats; map that to NaN."""
+    return float("nan") if x is None else float(x)
+
+
+def _is_nan(x) -> bool:
+    return x is None or (isinstance(x, float) and math.isnan(x))
+
+
+def _nan_to_none(x):
+    return None if _is_nan(x) else x
+
+
+def _fmt(x) -> str:
+    return "-" if _is_nan(x) else str(x)
+
+
+def _pct(part: float, whole: float) -> float:
+    return (part / whole) * 100 if whole > 0 else 0.0
+
 
 class ProfileReport:
-    """A tool for profiling and generating statistical summaries of pandas DataFrames."""
+    """A tool for profiling and generating statistical summaries of Polars DataFrames."""
 
-    def __init__(self, df: pd.DataFrame):
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input must be a pandas DataFrame.")
+    # Max points sent to the browser for box plots (histograms are binned in
+    # numpy, so they always use all of the data).
+    MAX_PLOT_POINTS: int = 50_000
+    PLOT_TEMPLATE: str = "plotly_white"
 
-        pd.set_option("future.no_silent_downcasting", True)
+    @staticmethod
+    def _from_pandas(pdf: "pd.DataFrame") -> pl.DataFrame:
+        """Convert a pandas DataFrame to polars.
+
+        The pandas index is dropped (reset it first if it carries information).
+        If the direct conversion fails -- typically because an ``object``
+        column mixes types -- those columns are cast to strings (keeping
+        missing values as nulls) and the conversion is retried.
+        """
+        try:
+            return pl.from_pandas(pdf, nan_to_null=True)
+        except Exception:
+            fixed = pdf.copy()
+            for c in fixed.select_dtypes(include="object").columns:
+                col = fixed[c]
+                fixed[c] = col.where(col.isna(), col.astype(str))
+            try:
+                return pl.from_pandas(fixed, nan_to_null=True)
+            except Exception as e:
+                raise TypeError(
+                    f"Could not convert the pandas DataFrame to polars: {e}"
+                ) from e
+
+    def __init__(self, df: pl.DataFrame | pl.LazyFrame | pd.DataFrame):
+        if pd is not None and isinstance(df, pd.DataFrame):
+            df = self._from_pandas(df)
+        elif isinstance(df, pl.LazyFrame):
+            df = df.collect()
+        if not isinstance(df, pl.DataFrame):
+            raise TypeError(
+                "Input must be a polars DataFrame/LazyFrame or a pandas DataFrame."
+            )
+
         self.df = df
 
-        # Initialize core attributes
+        # Core attributes
         self.num_vars: int = 0
         self.num_obs: int = 0
         self.total_cells: int = 0
@@ -32,200 +128,375 @@ class ProfileReport:
         self.dup_rows: int = 0
         self.dup_pct: float = 0.0
 
-        # Initialize dataframes & analysis outputs
-        self.basic_stats_df: pd.DataFrame = pd.DataFrame()
-        self.dtypes: pd.Series = pd.Series(dtype=object)
-        self.dtype_counts_df: pd.DataFrame = pd.DataFrame()
-        self.summary_df: pd.DataFrame = pd.DataFrame()
+        # Analysis outputs
+        self.basic_stats_df: pl.DataFrame = pl.DataFrame()
+        self.dtypes: dict[str, str] = {}
+        self.dtype_counts_df: pl.DataFrame = pl.DataFrame()
+        self.summary_df: pl.DataFrame = pl.DataFrame()
 
         self.missing_cols: list[str] = []
-        self.missing_df: pd.DataFrame = pd.DataFrame()
-        self.missing_corr: pd.DataFrame = pd.DataFrame()
+        self.missing_df: pl.DataFrame = pl.DataFrame()
+        self.missing_corr: pl.DataFrame = pl.DataFrame()
 
-        # Run profiling pipeline
+        # Internal caches
+        self._missing_mask: pl.DataFrame = pl.DataFrame()
+        self._missing_counts: dict[str, int] = {}
+        self._corr_cache: tuple[list[str], np.ndarray] | None = None
+
         self._profile_dataframe()
 
-    def _is_hashable(self, val) -> bool:
-        """Helper to check if a value or column contents can be hashed."""
-        try:
-            hash(val)
-            return True
-        except TypeError:
-            return False
+    # ------------------------------------------------------------------ #
+    # Generic helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_hashable_dtype(dtype: pl.DataType) -> bool:
+        """Object and nested dtypes (List/Array/Struct) are skipped for
+        duplicate / frequency checks, mirroring the unhashable check in the
+        pandas version."""
+        return dtype != pl.Object and not dtype.is_nested()
 
     def _get_hashable_subset(self) -> list[str]:
-        """Returns columns that can be safely used for duplicate checks."""
-        valid_cols = []
-        for col in self.df.columns:
-            sample = self.df[col].dropna()
-            if not sample.empty:
-                if self._is_hashable(sample.iloc[0]):
-                    valid_cols.append(col)
-            else:
-                valid_cols.append(col)
-        return valid_cols
+        """Columns that can be safely used for duplicate checks."""
+        return [c for c, dt in self.df.schema.items() if self._is_hashable_dtype(dt)]
 
+    @staticmethod
+    def _clean(s: pl.Series) -> pl.Series:
+        """Drop nulls (and NaN for float columns)."""
+        out = s.drop_nulls()
+        if s.dtype.is_float():
+            out = out.drop_nans()
+        return out
+
+    @staticmethod
+    def _missing_count(s: pl.Series) -> int:
+        n = s.null_count()
+        if s.dtype.is_float():
+            n += int(s.is_nan().sum() or 0)
+        return int(n)
+
+    @staticmethod
+    def _n_unique(s: pl.Series) -> int | None:
+        try:
+            return int(s.n_unique())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _top_frequency(clean: pl.Series) -> float | None:
+        try:
+            vc = clean.alias("value").value_counts(sort=True)
+            return float(vc[0, vc.width - 1]) / clean.len()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _top_value(clean: pl.Series) -> tuple[str | None, int | None]:
+        if clean.len() == 0:
+            return None, None
+        try:
+            vc = clean.alias("value").value_counts(sort=True)
+            return str(vc[0, 0]), int(vc[0, vc.width - 1])
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _kv_table(
+        key_name: str, items: list[tuple[str, object]], value_name: str = "Value"
+    ) -> pl.DataFrame:
+        """Two-column string table (mixed-type values are stringified, since a
+        polars column has a single dtype)."""
+        return pl.DataFrame(
+            {
+                key_name: [k for k, _ in items],
+                value_name: [str(v) for _, v in items],
+            }
+        )
+
+    @staticmethod
+    def _show_table(df: pl.DataFrame) -> None:
+        """Display a polars DataFrame without row/column truncation."""
+        with pl.Config(tbl_rows=-1, tbl_cols=-1, fmt_str_lengths=100):
+            display(df)
+
+    def _show_fig(self, fig: go.Figure, height: int | None = None) -> None:
+        fig.update_layout(
+            template=self.PLOT_TEMPLATE, margin=dict(l=60, r=30, t=70, b=50)
+        )
+        if height:
+            fig.update_layout(height=height)
+        fig.show()
+
+    def _plot_sample(self, arr: np.ndarray) -> np.ndarray:
+        if arr.size <= self.MAX_PLOT_POINTS:
+            return arr
+        rng = np.random.default_rng(0)
+        return rng.choice(arr, self.MAX_PLOT_POINTS, replace=False)
+
+    def _check_col(self, col: str) -> None:
+        if col not in self.df.columns:
+            raise ValueError(f"Column '{col}' not found in DataFrame.")
+
+    @staticmethod
+    def _pairwise_corr(frame: pl.DataFrame) -> np.ndarray:
+        """Pairwise-complete Pearson correlation matrix (like ``DataFrame.corr``
+        in pandas), computed with native polars expressions."""
+        cols = frame.columns
+        k = len(cols)
+        mat = np.full((k, k), np.nan)
+        if k == 0:
+            return mat
+
+        frame = frame.cast(pl.Float64).fill_nan(None)
+        exprs: list[pl.Expr] = []
+        pairs: list[tuple[int, int]] = []
+        for i in range(k):
+            for j in range(i, k):
+                a, b = pl.col(cols[i]), pl.col(cols[j])
+                valid = a.is_not_null() & b.is_not_null()
+                exprs.append(
+                    pl.corr(a.filter(valid), b.filter(valid)).alias(f"{i}_{j}")
+                )
+                pairs.append((i, j))
+
+        values = frame.select(exprs).row(0)
+        for (i, j), v in zip(pairs, values):
+            mat[i, j] = mat[j, i] = np.nan if v is None else v
+        return mat
+
+    def _numeric_corr(self) -> tuple[list[str], np.ndarray]:
+        """Cached (labels, correlation matrix) for numeric columns."""
+        if self._corr_cache is None:
+            num = self.df.select(cs.numeric())
+            labels = num.columns
+            mat = self._pairwise_corr(num) if len(labels) > 1 else np.empty((0, 0))
+            self._corr_cache = (labels, mat)
+        return self._corr_cache
+
+    # ------------------------------------------------------------------ #
+    # Profiling pipeline
+    # ------------------------------------------------------------------ #
     def _profile_dataframe(self) -> None:
         """Executes initialization steps sequentially with progress bar feedback."""
         with tqdm(total=4, desc="Understanding DataFrame") as pbar:
-            # Step 1: Basic Dimensions & Row Stats
             pbar.set_description("Calculating dataset dimensions & missing statistics")
             self._compute_basic_stats()
             pbar.update(1)
 
-            # Step 2: Data Types Breakdown
             pbar.set_description("Analyzing data types")
             self._compute_dtype_counts()
             pbar.update(1)
 
-            # Step 3: Column Summary Table
             pbar.set_description("Building statistical summary table")
             self._compute_summary()
             pbar.update(1)
 
-            # Step 4: Missing Value Breakdown & Correlations
             pbar.set_description("Analyzing missing value distributions")
             self._compute_missing_analysis()
             pbar.update(1)
 
+    def _build_missing_mask(self) -> pl.DataFrame:
+        """Boolean frame, True where a cell is null (or NaN for floats)."""
+        exprs = []
+        for name, dtype in self.df.schema.items():
+            e = pl.col(name).is_null()
+            if dtype.is_float():
+                e = e | pl.col(name).is_nan()
+            exprs.append(e.alias(name))
+        return self.df.select(exprs) if exprs else pl.DataFrame()
+
     def _compute_basic_stats(self) -> None:
-        self.num_vars = self.df.shape[1]
-        self.num_obs = self.df.shape[0]
+        self.num_vars = self.df.width
+        self.num_obs = self.df.height
         self.total_cells = self.num_vars * self.num_obs
 
-        self.missing_cells_count = int(self.df.isna().sum().sum())
-        self.missing_pct = (
-            (self.missing_cells_count / self.total_cells) * 100
-            if self.total_cells > 0
-            else 0.0
-        )
+        self._missing_mask = self._build_missing_mask()
+        if self._missing_mask.width:
+            row = self._missing_mask.select(pl.all().sum()).row(0, named=True)
+            self._missing_counts = {k: int(v or 0) for k, v in row.items()}
+        else:
+            self._missing_counts = {}
 
+        self.missing_cells_count = sum(self._missing_counts.values())
+        self.missing_pct = _pct(self.missing_cells_count, self.total_cells)
+
+        # Duplicates (rows identical to an earlier row, as in pandas `duplicated`)
         hashable_cols = self._get_hashable_subset()
-        if hashable_cols:
-            self.dup_rows = int(self.df.duplicated(subset=hashable_cols).sum())
+        if hashable_cols and self.num_obs > 0:
+            self.dup_rows = self.num_obs - int(self.df.select(hashable_cols).n_unique())
         else:
             self.dup_rows = 0
+        self.dup_pct = _pct(self.dup_rows, self.num_obs)
 
-        self.dup_pct = (self.dup_rows / self.num_obs) * 100 if self.num_obs > 0 else 0.0
-
-        self.basic_stats_df = pd.DataFrame(
-            {
-                "Metric": [
-                    "Number of variables",
-                    "Number of observations",
-                    "Missing cells",
-                    "Missing cells (%)",
-                    "Duplicate rows",
-                    "Duplicate rows (%)",
-                ],
-                "Value": [
-                    self.num_vars,
-                    self.num_obs,
-                    self.missing_cells_count,
-                    f"{self.missing_pct:.1f}%",
-                    self.dup_rows,
-                    f"{self.dup_pct:.1f}%",
-                ],
-            }
+        self.basic_stats_df = self._kv_table(
+            "Metric",
+            [
+                ("Number of variables", self.num_vars),
+                ("Number of observations", self.num_obs),
+                ("Missing cells", self.missing_cells_count),
+                ("Missing cells (%)", f"{self.missing_pct:.1f}%"),
+                ("Duplicate rows", self.dup_rows),
+                ("Duplicate rows (%)", f"{self.dup_pct:.1f}%"),
+            ],
         )
 
     def _compute_dtype_counts(self) -> None:
-        self.dtypes = self.df.dtypes.astype(str)
-        self.dtype_counts_df = self.dtypes.value_counts().reset_index()
-        self.dtype_counts_df.columns = ["Data Type", "Count"]
+        self.dtypes = {c: str(dt) for c, dt in self.df.schema.items()}
+        counts = Counter(self.dtypes.values())
+        self.dtype_counts_df = pl.DataFrame(
+            {"Data Type": list(counts.keys()), "Count": list(counts.values())},
+            schema={"Data Type": pl.String, "Count": pl.Int64},
+        ).sort("Count", descending=True)
 
     def _compute_summary(self) -> None:
-        # Convert unhashable/complex columns to string representation safely
-        df_eval = self.df.copy()
-        for col in df_eval.columns:
-            if df_eval[col].dtype == "object":
-                sample = df_eval[col].dropna()
-                if not sample.empty and not self._is_hashable(sample.iloc[0]):
-                    df_eval[col] = df_eval[col].apply(
-                        lambda x: str(x) if isinstance(x, (dict, list)) else x
+        """One row per variable (the pandas version returned the transpose)."""
+        schema = {
+            "column": pl.String,
+            "dtype": pl.String,
+            "count": pl.Int64,
+            "unique": pl.Int64,
+            "missing%": pl.Float64,
+            "mean": pl.Float64,
+            "std": pl.Float64,
+            "min": pl.Float64,
+            "median": pl.Float64,
+            "max": pl.Float64,
+            "top": pl.String,
+            "freq": pl.Int64,
+        }
+
+        rows: list[dict] = []
+        for col in self.df.columns:
+            s = self.df[col]
+            clean = self._clean(s)
+            n_missing = self._missing_counts.get(col, 0)
+            n_unique = self._n_unique(clean)
+
+            row = {k: None for k in schema}
+            row.update(
+                column=col,
+                dtype=str(s.dtype),
+                count=clean.len(),
+                # like nunique(dropna=False): missing counts as one more value
+                unique=None if n_unique is None else n_unique + (1 if n_missing else 0),
+                **{"missing%": round(_pct(n_missing, self.num_obs), 2)},
+            )
+
+            if s.dtype.is_numeric():
+                if clean.len() > 0:
+                    f = clean.cast(pl.Float64)
+                    row.update(
+                        mean=_nan_to_none(_num(f.mean())),
+                        std=_nan_to_none(_num(f.std())),
+                        min=_nan_to_none(_num(f.min())),
+                        median=_nan_to_none(_num(f.median())),
+                        max=_nan_to_none(_num(f.max())),
                     )
+            else:
+                row["top"], row["freq"] = self._top_value(clean)
 
-        df_description: DataFrame = df_eval.describe(include="all").T
-        summary: DataFrame = df_description.drop(
-            columns=["25%", "75%"], errors="ignore"
-        )
-        summary["dtype"] = self.dtypes
-        # Use df_eval.nunique() instead of self.df.nunique() to avoid dict hash crashes
-        summary["unique"] = df_eval.nunique(dropna=False)
-        summary["missing%"] = (self.df.isna().mean() * 100).round(2)
+            rows.append(row)
 
-        front_cols: list[str] = ["dtype", "count", "unique", "missing%"]
-        other_cols: list[str] = [c for c in summary.columns if c not in front_cols]
-
-        self.summary_df = (
-            summary[front_cols + other_cols].sort_values(by="dtype").fillna("-").T
+        self.summary_df = pl.DataFrame(rows, schema=schema).sort(
+            "dtype", maintain_order=True
         )
 
     def _compute_missing_analysis(self) -> None:
-        self.missing_cols = self.df.columns[self.df.isna().any()].tolist()
+        self.missing_cols = [c for c, n in self._missing_counts.items() if n > 0]
 
-        missing_counts = pd.DataFrame(
-            self.df.isna().sum().sort_values(ascending=False),
-            columns=["missing_count"],
-        )
-        missing_counts["missing_pct"] = (
-            (missing_counts["missing_count"] / self.num_obs * 100).round(2)
-            if self.num_obs > 0
-            else 0.0
-        )
-        self.missing_df = missing_counts
+        names = list(self._missing_counts.keys())
+        counts = [self._missing_counts[c] for c in names]
+        self.missing_df = pl.DataFrame(
+            {
+                "column": names,
+                "missing_count": counts,
+                "missing_pct": [round(_pct(n, self.num_obs), 2) for n in counts],
+            },
+            schema={
+                "column": pl.String,
+                "missing_count": pl.Int64,
+                "missing_pct": pl.Float64,
+            },
+        ).sort("missing_count", descending=True)
 
-        if self.missing_cols:
-            hashable_missing = [
-                c for c in self.missing_cols if c in self._get_hashable_subset()
-            ]
-            if len(hashable_missing) > 1:
-                self.missing_corr = self.df[hashable_missing].isna().corr()
-            else:
-                self.missing_corr = pd.DataFrame()
+        if len(self.missing_cols) > 1:
+            indicators = self._missing_mask.select(self.missing_cols)
+            mat = self._pairwise_corr(indicators)
+            corr = pl.DataFrame({c: mat[:, i] for i, c in enumerate(self.missing_cols)})
+            self.missing_corr = pl.concat(
+                [pl.DataFrame({"column": self.missing_cols}), corr],
+                how="horizontal",
+            )
         else:
-            self.missing_corr = pd.DataFrame()
+            self.missing_corr = pl.DataFrame()
 
+    # ------------------------------------------------------------------ #
+    # Overview
+    # ------------------------------------------------------------------ #
     def show_overview(self) -> None:
         """Renders the complete data overview directly in Jupyter Notebooks."""
         display(Markdown("# Data Overview"))
         display(Markdown("## Basic stats:"))
-        display(self.get_basic_stats())
+        self._show_table(self.get_basic_stats())
         display(Markdown("## Variable types:"))
-        display(self.get_dtype_counts())
+        self._show_table(self.get_dtype_counts())
         display(Markdown("## Data Alerts"))
-        display(self.get_alerts())
+        self._show_table(self.get_alerts())
         display(Markdown("## Data Summary:"))
-        display(self.get_summary())
+        self._show_table(self.get_summary())
         self.show_missing_report()
 
-        numeric_df = self.df.select_dtypes(include=[np.number])
-        if numeric_df.shape[1] > 1:
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(
-                numeric_df.corr(),
-                annot=True,
-                fmt=".2f",
-                cmap="coolwarm",
-                center=0,
-            )
-            plt.title("Correlation heatmap")
-            plt.tight_layout()
-            plt.show()
+        labels, corr = self._numeric_corr()
+        if len(labels) > 1:
+            self._corr_heatmap(labels, corr, "Correlation heatmap")
 
     def _ipython_display_(self) -> None:
         self.show_overview()
 
-    def get_basic_stats(self) -> pd.DataFrame:
+    def get_basic_stats(self) -> pl.DataFrame:
         return self.basic_stats_df
 
-    def get_dtype_counts(self) -> pd.DataFrame:
+    def get_dtype_counts(self) -> pl.DataFrame:
         return self.dtype_counts_df
 
-    def get_summary(self) -> pd.DataFrame:
+    def get_summary(self) -> pl.DataFrame:
         return self.summary_df
 
-    def show_missing_report(self) -> None:
+    def _corr_heatmap(
+        self,
+        labels: list[str],
+        matrix: np.ndarray,
+        title: str,
+        mask_upper: bool = False,
+    ) -> None:
+        z = np.array(matrix, dtype=float)
+        if mask_upper:  # hide upper triangle + diagonal, like the seaborn mask
+            z[np.triu_indices_from(z)] = np.nan
+
+        fig = go.Figure(
+            go.Heatmap(
+                z=z,
+                x=labels,
+                y=labels,
+                zmin=-1,
+                zmax=1,
+                colorscale="RdBu_r",
+                texttemplate="%{z:.2f}",
+                hoverongaps=False,
+                colorbar=dict(title="r"),
+            )
+        )
+        size = int(min(900, max(450, 60 * len(labels) + 150)))
+        fig.update_xaxes(type="category")
+        fig.update_yaxes(type="category", autorange="reversed")
+        fig.update_layout(title=title, width=size + 100, height=size)
+        self._show_fig(fig)
+
+    def show_missing_report(self, max_matrix_rows: int = 5_000) -> None:
+        """Missing-value tables and charts.
+
+        ``max_matrix_rows`` caps the number of rows drawn in the missing-value
+        matrix (rows are thinned evenly) so large frames stay responsive.
+        """
         if self.missing_cells_count == 0:
             return
 
@@ -239,34 +510,61 @@ class ProfileReport:
         display(Markdown(" - Variables with missing values:"))
         display(self.missing_cols)
         display(Markdown(" - Missing count table"))
-        display(self.missing_df)
+        self._show_table(self.missing_df)
 
-        if not self.missing_df.empty and self.missing_cells_count > 0:
-            plt.title("Percentage of Missing Values by variable")
-            sns.barplot(
-                data=self.missing_df.missing_pct.sort_values(ascending=False),
-                orient="h",
+        # 1. Percentage of missing values by variable (only affected columns)
+        miss = self.missing_df.filter(pl.col("missing_count") > 0).sort("missing_pct")
+        pcts = miss["missing_pct"].to_list()
+        fig = go.Figure(
+            go.Bar(
+                x=pcts,
+                y=miss["column"].to_list(),
+                orientation="h",
+                text=[f"{p:.1f}%" for p in pcts],
+                textposition="auto",
+                marker_color="#4c72b0",
             )
-            plt.xlabel("Percentage of Missing Values")
-            plt.show()
+        )
+        fig.update_yaxes(type="category")
+        fig.update_layout(
+            title="Percentage of Missing Values by variable",
+            xaxis_title="Percentage of Missing Values",
+        )
+        self._show_fig(fig, height=max(300, 28 * len(pcts) + 140))
 
-            plt.title("Missing Value matrix")
-            sns.heatmap(self.df.isna().T, cbar=False)
-            plt.show()
+        # 2. Missing value matrix
+        step = max(1, math.ceil(self.num_obs / max_matrix_rows))
+        sampled = self._missing_mask.gather_every(step)
+        z = sampled.to_numpy().T.astype(np.int8)
+        title = "Missing Value matrix"
+        if step > 1:
+            title += f" (every {step}th row shown)"
+        fig = go.Figure(
+            go.Heatmap(
+                z=z,
+                x=np.arange(0, self.num_obs, step),
+                y=sampled.columns,
+                colorscale=[[0, "#f2f2f2"], [1, "#222222"]],
+                showscale=False,
+                xgap=0,
+                ygap=1,
+                hovertemplate="row %{x}<br>%{y}<br>missing=%{z}<extra></extra>",
+            )
+        )
+        fig.update_yaxes(type="category", autorange="reversed")
+        fig.update_layout(title=title, xaxis_title="Row index")
+        self._show_fig(fig, height=max(300, 22 * self.num_vars + 140))
 
-            if not self.missing_corr.empty and len(self.missing_cols) > 1:
-                plt.title("Missing Value Correlation")
-                mask = np.triu(np.ones_like(self.missing_corr, dtype=bool))
-                sns.heatmap(
-                    self.missing_corr,
-                    annot=True,
-                    fmt=".2f",
-                    cmap="coolwarm",
-                    cbar=True,
-                    mask=mask,
-                )
-                plt.show()
+        # 3. Missing value correlation (lower triangle)
+        if not self.missing_corr.is_empty() and len(self.missing_cols) > 1:
+            mat = self.missing_corr.drop("column").to_numpy()
+            self._corr_heatmap(
+                self.missing_cols, mat, "Missing Value Correlation", mask_upper=True
+            )
 
+    # ------------------------------------------------------------------ #
+    # Alerts
+    # ------------------------------------------------------------------ #
     def get_alerts(
         self,
         correlation_threshold: float = 0.8,
@@ -275,404 +573,321 @@ class ProfileReport:
         skewness_threshold: float = 1.0,
         uniform_pvalue_threshold: float = 0.999,
         duplicate_threshold: int = 10,
-    ) -> pd.DataFrame:
-        alerts_list: list[dict[str, str]] = []
+    ) -> pl.DataFrame:
+        alerts: list[dict[str, str]] = []
+        schema = {"Description": pl.String, "Alert Type": pl.String}
 
-        if self.df.empty:
-            return pd.DataFrame(
-                [{"Description": "Dataset is empty", "Alert Type": "Empty"}]
+        def add(description: str, alert_type: str) -> None:
+            alerts.append({"Description": description, "Alert Type": alert_type})
+
+        if self.df.is_empty():
+            return pl.DataFrame(
+                [{"Description": "Dataset is empty", "Alert Type": "Empty"}],
+                schema=schema,
             )
 
         if self.dup_rows > duplicate_threshold:
-            alerts_list.append(
-                {
-                    "Description": (
-                        f"Dataset has {self.dup_rows} ({self.dup_pct:.1f}%) duplicate"
-                        " rows"
-                    ),
-                    "Alert Type": "Duplicates",
-                }
+            add(
+                f"Dataset has {self.dup_rows} ({self.dup_pct:.1f}%) duplicate rows",
+                "Duplicates",
             )
 
-        numeric_df = self.df.select_dtypes(include=[np.number])
-        if numeric_df.shape[1] > 1:
-            corr_matrix = numeric_df.corr().abs()
-            for col in corr_matrix.columns:
-                high_corr_cols = corr_matrix.index[
-                    (corr_matrix[col] >= correlation_threshold)
-                    & (corr_matrix.index != col)
-                ].tolist()
-
-                if high_corr_cols:
-                    main_target = high_corr_cols[0]
-                    other_count = len(high_corr_cols) - 1
-                    other_text = (
-                        f" and {other_count} other fields" if other_count > 0 else ""
-                    )
-                    alerts_list.append(
-                        {
-                            "Description": (
-                                f"{col} is highly correlated with"
-                                f" {main_target}{other_text}"
-                            ),
-                            "Alert Type": "High correlation",
-                        }
+        # High correlation
+        labels, corr = self._numeric_corr()
+        if len(labels) > 1:
+            abs_corr = np.abs(corr)
+            for i, col in enumerate(labels):
+                hits = [
+                    labels[j]
+                    for j in range(len(labels))
+                    if j != i and abs_corr[i, j] >= correlation_threshold
+                ]
+                if hits:
+                    other = len(hits) - 1
+                    other_text = f" and {other} other fields" if other > 0 else ""
+                    add(
+                        f"{col} is highly correlated with {hits[0]}{other_text}",
+                        "High correlation",
                     )
 
         for col in self.df.columns:
             s = self.df[col]
-            clean_s = s.dropna()
-            n_unique = clean_s.nunique()
-            n_missing = s.isnull().sum()
+            clean = self._clean(s)
+            n_unique = self._n_unique(clean)
+            n_missing = self._missing_counts.get(col, 0)
+            hashable = self._is_hashable_dtype(s.dtype)
 
             if n_unique == 1:
-                val = clean_s.iloc[0] if not clean_s.empty else ""
-                alerts_list.append(
-                    {
-                        "Description": f'{col} has constant value "{val}"',
-                        "Alert Type": "Constant",
-                    }
-                )
-                if val == 0:
-                    alerts_list.append(
-                        {
-                            "Description": f"{col} contains only zeros",
-                            "Alert Type": "Zeros",
-                        }
-                    )
-            elif n_unique > high_cardinality_threshold:
-                alerts_list.append(
-                    {
-                        "Description": (
-                            f"{col} has a high cardinality: {n_unique} distinct values"
-                        ),
-                        "Alert Type": "High cardinality",
-                    }
+                val = clean[0]
+                add(f'{col} has constant value "{val}"', "Constant")
+                if val == 0 and not isinstance(val, bool):
+                    add(f"{col} contains only zeros", "Zeros")
+            elif n_unique is not None and n_unique > high_cardinality_threshold:
+                add(
+                    f"{col} has a high cardinality: {n_unique} distinct values",
+                    "High cardinality",
                 )
 
-            sample_val = clean_s.iloc[0] if not clean_s.empty else None
-            if not clean_s.empty and n_unique > 1 and self._is_hashable(sample_val):
-                try:
-                    top_freq = clean_s.value_counts(normalize=True).iloc[0]
-                    if top_freq >= imbalance_threshold:
-                        pct = round(top_freq * 100, 1)
-                        alerts_list.append(
-                            {
-                                "Description": (
-                                    f"{col} is highly imbalanced ({pct}% top value)"
-                                ),
-                                "Alert Type": "Imbalance",
-                            }
-                        )
-                except Exception:
-                    pass
+            if n_unique is not None and n_unique > 1 and hashable:
+                top_freq = self._top_frequency(clean)
+                if top_freq is not None and top_freq >= imbalance_threshold:
+                    add(
+                        f"{col} is highly imbalanced ({round(top_freq * 100, 1)}% top value)",
+                        "Imbalance",
+                    )
 
             if n_missing > 0:
-                pct = round((n_missing / self.num_obs) * 100, 1)
-                alerts_list.append(
-                    {
-                        "Description": f"{col} has {n_missing} ({pct}%) missing values",
-                        "Alert Type": "Missing",
-                    }
-                )
+                pct = round(_pct(n_missing, self.num_obs), 1)
+                add(f"{col} has {n_missing} ({pct}%) missing values", "Missing")
 
-            if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-                inf_count = np.isinf(s).sum()
+            if s.dtype.is_float():
+                inf_count = int(s.is_infinite().sum() or 0)
                 if inf_count > 0:
-                    alerts_list.append(
-                        {
-                            "Description": f"{col} has {inf_count} infinite values",
-                            "Alert Type": "Infinite",
-                        }
-                    )
+                    add(f"{col} has {inf_count} infinite values", "Infinite")
 
-            if (
-                n_unique == self.num_obs
-                and self.num_obs > 0
-                and self._is_hashable(sample_val)
-            ):
-                alerts_list.append(
-                    {
-                        "Description": f"{col} has all unique values",
-                        "Alert Type": "Unique",
-                    }
-                )
+            if n_unique == self.num_obs and self.num_obs > 0 and hashable:
+                add(f"{col} has all unique values", "Unique")
 
-            if (
-                pd.api.types.is_numeric_dtype(s)
-                and not pd.api.types.is_bool_dtype(s)
-                and len(clean_s) > 3
-            ):
-                col_skew = abs(clean_s.skew())
-                if col_skew >= skewness_threshold:
-                    alerts_list.append(
-                        {
-                            "Description": f"{col} is highly skewed ({round(col_skew, 2)})",
-                            "Alert Type": "Skewed",
-                        }
-                    )
+            if s.dtype.is_numeric() and clean.len() > 3:
+                finite = clean.cast(pl.Float64)
+                finite = finite.filter(finite.is_finite())
+                if finite.len() > 3:
+                    col_skew = abs(_num(finite.skew(bias=False)))
+                    if not math.isnan(col_skew) and col_skew >= skewness_threshold:
+                        add(
+                            f"{col} is highly skewed ({round(col_skew, 2)})",
+                            "Skewed",
+                        )
 
                 try:
-                    counts, _ = np.histogram(clean_s, bins=10)
+                    counts, _ = np.histogram(clean.to_numpy(), bins=10)
                     _, p_val = stats.chisquare(counts)
                     if p_val >= uniform_pvalue_threshold:
-                        alerts_list.append(
-                            {
-                                "Description": f"{col} follows a uniform distribution",
-                                "Alert Type": "Uniform",
-                            }
-                        )
+                        add(f"{col} follows a uniform distribution", "Uniform")
                 except Exception:
                     pass
 
-        if not alerts_list:
-            return pd.DataFrame(columns=["Description", "Alert Type"])
+        return pl.DataFrame(alerts, schema=schema)
 
-        return pd.DataFrame(alerts_list)
+    # ------------------------------------------------------------------ #
+    # Univariate: text
+    # ------------------------------------------------------------------ #
+    def text_univ(self, col: str) -> None:
+        """Text statistics (length, unicode, samples, word frequencies) plus a word cloud."""
+        self._check_col(col)
 
-    def text_univ(self, col: str):
-        """Computes comprehensive text statistics matching ydata-profiling,
+        n = self.df.height
+        s = self.df[col]
+        clean = self._clean(s).cast(pl.String)
 
-        displays length, unicode, sample, and word frequency tables, and plots a word
-        cloud.
-        """
-        if col not in self.df.columns:
-            raise ValueError(f"Column '{col}' not found in DataFrame.")
+        # 1. Basic metrics
+        distinct = clean.n_unique()
+        distinct_pct = _pct(distinct, n)
+        missing = self._missing_count(s)
+        missing_pct = _pct(missing, n)
+        mem_str = _format_bytes(s.estimated_size())
 
-        n = len(self.df)
-        original_col = self.df[col]
-        clean_s = original_col.dropna().astype(str)
+        # 2. Length statistics
+        lengths = clean.str.len_chars()
+        has_data = lengths.len() > 0
+        max_len = lengths.max() if has_data else 0
+        min_len = lengths.min() if has_data else 0
+        mean_len = _num(lengths.mean()) if has_data else 0.0
+        median_len = _num(lengths.median()) if has_data else 0.0
 
-        # --- 1. Basic Metrics ---
-        distinct = clean_s.nunique()
-        distinct_pct = (distinct / n * 100) if n > 0 else 0.0
-
-        missing = original_col.isna().sum()
-        missing_pct = (missing / n * 100) if n > 0 else 0.0
-
-        mem_bytes = original_col.memory_usage(deep=True)
-        if mem_bytes < 1024:
-            mem_str = f"{mem_bytes} B"
-        elif mem_bytes < 1024 * 1024:
-            mem_str = f"{mem_bytes / 1024:.1f} KiB"
-        else:
-            mem_str = f"{mem_bytes / (1024 * 1024):.1f} MiB"
-
-        # --- 2. Length Statistics ---
-        lengths = clean_s.str.len()
-        max_len = lengths.max() if not lengths.empty else 0
-        min_len = lengths.min() if not lengths.empty else 0
-        mean_len = lengths.mean() if not lengths.empty else 0.0
-        median_len = lengths.median() if not lengths.empty else 0.0
-
-        # --- 3. Characters & Unicode Statistics ---
-        all_text = "".join(clean_s.tolist())
+        # 3. Characters & unicode
+        all_text = "".join(clean.to_list())
         total_chars = len(all_text)
         distinct_chars = len(set(all_text))
         distinct_categories = len({unicodedata.category(c) for c in all_text})
+        # NOTE: scripts / blocks are placeholders (as in the original); real
+        # values would need a Unicode database such as `unicodedata2`.
         distinct_scripts = 1 if all_text else 0
         distinct_blocks = 1 if all_text else 0
 
-        # --- 4. Word Frequency Statistics (Top 5 & Bottom 5) ---
-        words = re.findall(r"\b\w+\b", all_text.lower())
+        # 4. Word frequencies. Rows are joined with a newline so the last word
+        # of one row never fuses with the first word of the next.
+        corpus = "\n".join(clean.to_list())
+        words = re.findall(r"\b\w+\b", corpus.lower())
         word_counts = Counter(words)
         most_common = word_counts.most_common(5)
+        bottom_common = sorted(word_counts.items(), key=lambda x: (x[1], x[0]))[:5]
 
-        # Sort by frequency ascending, then alphabetically for bottom 5
-        sorted_words = sorted(word_counts.items(), key=lambda x: (x[1], x[0]))
-        bottom_common = sorted_words[:5]
+        # 5. Sample rows
+        sample_rows = clean.head(5).to_list()
+        sample_rows += ["-"] * (5 - len(sample_rows))
 
-        # --- 5. Sample Rows (First 5 rows) ---
-        sample_rows = clean_s.head(5).tolist()
-        while len(sample_rows) < 5:
-            sample_rows.append("-")
-
-        # --- Display Header and Tables ---
+        # --- Display ---
         display(Markdown(f"### **{col}**"))
         display(Markdown("*Text*"))
 
-        # Overview Table
         display(Markdown("#### Overview"))
-        overview_table = pd.DataFrame(
-            {
-                "Metric": [
-                    "Distinct",
-                    "Distinct (%)",
-                    "Missing",
-                    "Missing (%)",
-                    "Memory size",
+        self._show_table(
+            self._kv_table(
+                "Metric",
+                [
+                    ("Distinct", distinct),
+                    ("Distinct (%)", f"{distinct_pct:.1f}%"),
+                    ("Missing", missing),
+                    ("Missing (%)", f"{missing_pct:.1f}%"),
+                    ("Memory size", mem_str),
                 ],
-                "Value": [
-                    distinct,
-                    f"{distinct_pct:.1f}%",
-                    missing,
-                    f"{missing_pct:.1f}%",
-                    mem_str,
-                ],
-            }
+            )
         )
-        display(overview_table)
 
-        # Length Statistics Table
         display(Markdown("#### Length statistics"))
-        length_table = pd.DataFrame(
-            {
-                "Length Metric": [
-                    "Max length",
-                    "Median length",
-                    "Mean length",
-                    "Min length",
+        self._show_table(
+            self._kv_table(
+                "Length Metric",
+                [
+                    ("Max length", max_len),
+                    ("Median length", median_len),
+                    ("Mean length", f"{mean_len:.4f}"),
+                    ("Min length", min_len),
                 ],
-                "Value": [max_len, median_len, f"{mean_len:.4f}", min_len],
-            }
+            )
         )
-        display(length_table)
 
-        # Characters and Unicode Table
         display(Markdown("#### Characters and Unicode"))
-        unicode_table = pd.DataFrame(
-            {
-                "Characters and Unicode": [
-                    "Total characters",
-                    "Distinct characters",
-                    "Distinct categories",
-                    "Distinct scripts",
-                    "Distinct blocks",
+        self._show_table(
+            self._kv_table(
+                "Characters and Unicode",
+                [
+                    ("Total characters", f"{total_chars:,}"),
+                    ("Distinct characters", distinct_chars),
+                    ("Distinct categories", distinct_categories),
+                    ("Distinct scripts", distinct_scripts),
+                    ("Distinct blocks", distinct_blocks),
                 ],
-                "Value": [
-                    f"{total_chars:,}",
-                    distinct_chars,
-                    distinct_categories,
-                    distinct_scripts,
-                    distinct_blocks,
-                ],
-            }
+            )
         )
-        display(unicode_table)
 
-        # Unique Table
         display(Markdown("#### Unique statistics"))
-        unique_table = pd.DataFrame(
-            {
-                "Unique": ["Unique", "Unique (%)"],
-                "Value": [distinct, f"{distinct_pct:.1f}%"],
-            }
+        self._show_table(
+            self._kv_table(
+                "Unique",
+                [("Unique", distinct), ("Unique (%)", f"{distinct_pct:.1f}%")],
+            )
         )
-        display(unique_table)
 
-        # Sample Table
         display(Markdown("#### Sample rows"))
-        sample_table = pd.DataFrame(
-            {
-                "Sample": ["1st row", "2nd row", "3rd row", "4th row", "5th row"],
-                "Value": sample_rows,
-            }
+        self._show_table(
+            self._kv_table(
+                "Sample",
+                list(
+                    zip(
+                        ["1st row", "2nd row", "3rd row", "4th row", "5th row"],
+                        sample_rows,
+                    )
+                ),
+            )
         )
-        display(sample_table)
 
-        # Word Frequency Tables
         display(Markdown("#### Word Frequency Analysis"))
-        top_words_df = pd.DataFrame(
-            most_common, columns=["Most Frequent Word", "Count"]
+        top_words_df = pl.DataFrame(
+            most_common,
+            schema={"Most Frequent Word": pl.String, "Count": pl.Int64},
+            orient="row",
         )
-        bottom_words_df = pd.DataFrame(
-            bottom_common, columns=["Least Frequent Word", "Count"]
+        bottom_words_df = pl.DataFrame(
+            bottom_common,
+            schema={"Least Frequent Word": pl.String, "Count": pl.Int64},
+            orient="row",
         )
-
         display(Markdown("**Top 5 Most Frequent Words:**"))
-        display(top_words_df)
-
+        self._show_table(top_words_df)
         display(Markdown("**Bottom 5 Least Frequent Words:**"))
-        display(bottom_words_df)
+        self._show_table(bottom_words_df)
 
-        # --- 6. WordCloud Generation ---
-        if all_text.strip():
-            wordcloud = WordCloud(
-                width=800,
-                height=400,
-                background_color="white",
-                colormap="Dark2",
-                max_words=150,
-                contour_width=1,
-            ).generate(all_text)
+        # 6. Word cloud (rendered as an image trace)
+        if word_counts:
+            try:
+                wc = WordCloud(
+                    width=800,
+                    height=400,
+                    background_color="white",
+                    colormap="Dark2",
+                    max_words=150,
+                    contour_width=1,
+                ).generate(corpus)
+            except ValueError:  # e.g. only single-character tokens
+                return
 
-            plt.figure(figsize=(10, 5))
-            plt.imshow(wordcloud, interpolation="bilinear")
-            plt.axis("off")
-            plt.title(f"Word Cloud of {col}", fontsize=14, fontweight="bold", pad=15)
-            plt.tight_layout()
-            plt.show()
+            fig = go.Figure(go.Image(z=wc.to_array()))
+            fig.update_xaxes(visible=False)
+            fig.update_yaxes(visible=False)
+            fig.update_layout(
+                title=dict(text=f"<b>Word Cloud of {col}</b>"), width=820, height=470
+            )
+            self._show_fig(fig)
 
-    def numeric_univ(self, col: str):
-        """Computes basic, quantile, and descriptive statistics matching ydata-profiling,
-
-        displays the metrics tables, and plots both a histogram and a boxplot.
-        """
-        if col not in self.df.columns:
-            raise ValueError(f"Column '{col}' not found in DataFrame.")
+    # ------------------------------------------------------------------ #
+    # Univariate: numeric
+    # ------------------------------------------------------------------ #
+    def numeric_univ(self, col: str) -> None:
+        """Basic, quantile and descriptive statistics, plus histogram (with KDE) and boxplot."""
+        self._check_col(col)
 
         s = self.df[col]
-        n = len(self.df)
-        clean_s = s.dropna()
-
-        if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
+        if not s.dtype.is_numeric():  # excludes Boolean
             raise TypeError(f"Column '{col}' must be a continuous numeric type.")
 
-        # --- 1. Basic Metrics Calculation ---
-        distinct = clean_s.nunique()
-        distinct_pct = (distinct / n * 100) if n > 0 else 0.0
+        n = s.len()
+        clean = self._clean(s)
+        has_data = clean.len() > 0
+        clean_f = clean.cast(pl.Float64)
 
-        missing = s.isna().sum()
-        missing_pct = (missing / n * 100) if n > 0 else 0.0
+        # --- 1. Basic metrics ---
+        distinct = clean.n_unique()
+        distinct_pct = _pct(distinct, n)
+        missing = self._missing_count(s)
+        missing_pct = _pct(missing, n)
+        infinite = int(s.is_infinite().sum() or 0) if s.dtype.is_float() else 0
+        infinite_pct = _pct(infinite, n)
+        zeros = int((s == 0).sum() or 0)
+        zeros_pct = _pct(zeros, n)
+        negative = int((s < 0).sum() or 0)
+        negative_pct = _pct(negative, n)
 
-        infinite = np.isinf(s).sum()
-        infinite_pct = (infinite / n * 100) if n > 0 else 0.0
+        mean_val = _num(clean_f.mean()) if has_data else np.nan
+        min_val = clean.min() if has_data else None
+        max_val = clean.max() if has_data else None
+        mem_str = _format_bytes(s.estimated_size())
 
-        zeros = (s == 0).sum()
-        zeros_pct = (zeros / n * 100) if n > 0 else 0.0
+        # --- 2. Quantiles (linear interpolation, as pandas; polars defaults to "nearest") ---
+        def q(p: float) -> float:
+            return (
+                _num(clean_f.quantile(p, interpolation="linear"))
+                if has_data
+                else np.nan
+            )
 
-        negative = (s < 0).sum()
-        negative_pct = (negative / n * 100) if n > 0 else 0.0
+        q1, median_val, q3 = q(0.25), q(0.5), q(0.75)
+        p5, p95 = q(0.05), q(0.95)
+        iqr = q3 - q1
+        rng = _num(max_val) - _num(min_val) if has_data else np.nan
 
-        mean_val = clean_s.mean() if not clean_s.empty else np.nan
-        min_val = clean_s.min() if not clean_s.empty else np.nan
-        max_val = clean_s.max() if not clean_s.empty else np.nan
-
-        mem_bytes = s.memory_usage(deep=True)
-        if mem_bytes < 1024:
-            mem_str = f"{mem_bytes} B"
-        elif mem_bytes < 1024 * 1024:
-            mem_str = f"{mem_bytes / 1024:.1f} KiB"
-        else:
-            mem_str = f"{mem_bytes / (1024 * 1024):.1f} MiB"
-
-        # --- 2. Quantile Statistics Calculation ---
-        q1 = clean_s.quantile(0.25) if not clean_s.empty else np.nan
-        median_val = clean_s.median() if not clean_s.empty else np.nan
-        q3 = clean_s.quantile(0.75) if not clean_s.empty else np.nan
-        p5 = clean_s.quantile(0.05) if not clean_s.empty else np.nan
-        p95 = clean_s.quantile(0.95) if not clean_s.empty else np.nan
-        iqr = q3 - q1 if not (pd.isna(q3) or pd.isna(q1)) else np.nan
-        rng = (
-            max_val - min_val if not (pd.isna(max_val) or pd.isna(min_val)) else np.nan
-        )
-
-        # --- 3. Descriptive Statistics Calculation ---
-        std_val = clean_s.std() if not clean_s.empty else np.nan
+        # --- 3. Descriptive statistics (bias-corrected, matching pandas) ---
+        std_val = _num(clean_f.std()) if has_data else np.nan
         cv_val = (
             std_val / abs(mean_val)
             if mean_val != 0 and not np.isnan(mean_val)
             else np.nan
         )
-        kurt_val = clean_s.kurt() if not clean_s.empty else np.nan
-        skew_val = clean_s.skew() if not clean_s.empty else np.nan
-        sum_val = clean_s.sum() if not clean_s.empty else np.nan
-        var_val = clean_s.var() if not clean_s.empty else np.nan
-        mad_val = (clean_s - median_val).abs().median() if not clean_s.empty else np.nan
+        kurt_val = (
+            _num(clean_f.kurtosis(fisher=True, bias=False)) if has_data else np.nan
+        )
+        skew_val = _num(clean_f.skew(bias=False)) if has_data else np.nan
+        sum_val = clean.sum() if has_data else np.nan
+        var_val = _num(clean_f.var()) if has_data else np.nan
+        mad_val = _num((clean_f - median_val).abs().median()) if has_data else np.nan
 
-        # Monotonicity check
-        is_inc = s.is_monotonic_increasing
-        is_dec = s.is_monotonic_decreasing
+        # Monotonicity (like pandas: any missing value => not monotonic)
+        if missing == 0:
+            is_inc = s.is_sorted()
+            is_dec = s.is_sorted(descending=True)
+        else:
+            is_inc = is_dec = False
         if is_inc and is_dec:
             monotonicity = "Constant"
         elif is_inc:
@@ -682,13 +897,12 @@ class ProfileReport:
         else:
             monotonicity = "Not monotonic"
 
-        # --- Display Header and Tables ---
+        # --- Display ---
         display(Markdown(f"### **{col}**"))
         display(Markdown(f"*Real number (ℝ)* — DataType: `{s.dtype}`"))
 
-        # Overview Table
         display(Markdown("#### Overview statistics"))
-        basic_table = pd.DataFrame(
+        basic_table = pl.DataFrame(
             {
                 "Metric (Left)": [
                     "Distinct",
@@ -700,11 +914,11 @@ class ProfileReport:
                     "Mean",
                 ],
                 "Value (Left)": [
-                    distinct,
+                    str(distinct),
                     f"{distinct_pct:.1f}%",
-                    missing,
+                    str(missing),
                     f"{missing_pct:.1f}%",
-                    infinite,
+                    str(infinite),
                     f"{infinite_pct:.1f}%",
                     f"{mean_val:.4f}" if not np.isnan(mean_val) else "-",
                 ],
@@ -718,21 +932,20 @@ class ProfileReport:
                     "Memory size",
                 ],
                 "Value (Right)": [
-                    min_val,
-                    max_val,
-                    zeros,
+                    _fmt(min_val),
+                    _fmt(max_val),
+                    str(zeros),
                     f"{zeros_pct:.1f}%",
-                    negative,
+                    str(negative),
                     f"{negative_pct:.1f}%",
                     mem_str,
                 ],
             }
         )
-        display(basic_table)
+        self._show_table(basic_table)
 
-        # Quantile & Descriptive Side-by-Side Tables
         display(Markdown("#### Quantile & Descriptive statistics"))
-        quantile_table = pd.DataFrame(
+        quantile_table = pl.DataFrame(
             {
                 "Quantile statistic": [
                     "Minimum",
@@ -745,11 +958,27 @@ class ProfileReport:
                     "Range",
                     "Interquartile range (IQR)",
                 ],
-                "Value": [min_val, p5, q1, median_val, q3, p95, max_val, rng, iqr],
-            }
+                "Value": [
+                    _nan_to_none(None if min_val is None else float(min_val)),
+                    _nan_to_none(p5),
+                    _nan_to_none(q1),
+                    _nan_to_none(median_val),
+                    _nan_to_none(q3),
+                    _nan_to_none(p95),
+                    _nan_to_none(None if max_val is None else float(max_val)),
+                    _nan_to_none(rng),
+                    _nan_to_none(iqr),
+                ],
+            },
+            schema={"Quantile statistic": pl.String, "Value": pl.Float64},
         )
 
-        desc_table = pd.DataFrame(
+        def sci_or_plain(x) -> str:
+            if isinstance(x, float) and np.isnan(x):
+                return "nan"
+            return f"{x:.6e}" if abs(x) > 1e6 else f"{x}"
+
+        desc_table = pl.DataFrame(
             {
                 "Descriptive statistic": [
                     "Standard deviation",
@@ -764,80 +993,148 @@ class ProfileReport:
                 ],
                 "Value": [
                     f"{std_val:.5f}" if not np.isnan(std_val) else "-",
-                    f"{cv_val:.8f}" if not np.isnan(float(cv_val)) else "-",
+                    f"{cv_val:.8f}" if not np.isnan(cv_val) else "-",
                     f"{kurt_val:.7f}" if not np.isnan(kurt_val) else "-",
                     f"{mean_val:.3f}" if not np.isnan(mean_val) else "-",
-                    f"{mad_val}" if not np.isnan(float(mad_val)) else "-",
+                    f"{mad_val}" if not np.isnan(mad_val) else "-",
                     f"{skew_val:.8f}" if not np.isnan(skew_val) else "-",
-                    f"{sum_val:.6e}" if abs(sum_val) > 1e6 else f"{sum_val}",
-                    f"{var_val:.6e}" if abs(var_val) > 1e6 else f"{var_val}",
+                    sci_or_plain(sum_val),
+                    sci_or_plain(var_val),
                     monotonicity,
                 ],
             }
         )
+        self._show_table(quantile_table)
+        self._show_table(desc_table)
 
-        # Display them as side-by-side markdown tables or separate tables
-        display(quantile_table)
-        display(desc_table)
+        # --- Histogram (+ KDE) and boxplot ---
+        x = clean_f.filter(clean_f.is_finite()).to_numpy()
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=(f"Histogram of {col}", f"Boxplot of {col}"),
+        )
 
-        # --- Plotting Histogram & Boxplot ---
-        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+        if x.size:
+            edges = np.histogram_bin_edges(x, bins="auto")
+            n_bins = max(1, min(len(edges) - 1, 100))
+            counts, edges = np.histogram(x, bins=n_bins)
+            width = float(edges[1] - edges[0])
+            centers = (edges[:-1] + edges[1:]) / 2
 
-        sns.histplot(data=self.df, x=col, ax=axes[0], kde=True, color="dodgerblue")
-        axes[0].set_title(f"Histogram of {col}")
-        axes[0].set_xlabel(col)
-        axes[0].set_ylabel("Frequency")
+            fig.add_trace(
+                go.Bar(
+                    x=centers,
+                    y=counts,
+                    width=width,
+                    marker_color="dodgerblue",
+                    opacity=0.6,
+                    showlegend=False,
+                    hovertemplate="%{x}<br>count=%{y}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
 
-        sns.boxplot(data=self.df, x=col, ax=axes[1], color="lightgreen")
-        axes[1].set_title(f"Boxplot of {col}")
-        axes[1].set_xlabel(col)
+            # KDE overlay, scaled to counts (like seaborn's kde=True)
+            try:
+                if np.unique(x[:10_000]).size > 1:
+                    kde_sample = x
+                    if x.size > 10_000:
+                        kde_sample = np.random.default_rng(0).choice(
+                            x, 10_000, replace=False
+                        )
+                    kde = stats.gaussian_kde(kde_sample)
+                    grid = np.linspace(edges[0], edges[-1], 200)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=grid,
+                            y=kde(grid) * x.size * width,
+                            mode="lines",
+                            line=dict(color="navy", width=2),
+                            showlegend=False,
+                            hoverinfo="skip",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+            except Exception:
+                pass
 
-        plt.tight_layout()
-        plt.show()
+            fig.add_trace(
+                go.Box(
+                    x=self._plot_sample(x),
+                    name="",
+                    orientation="h",
+                    marker_color="mediumseagreen",
+                    boxpoints="outliers",
+                    showlegend=False,
+                ),
+                row=1,
+                col=2,
+            )
 
-    def date_univ(self, col: str):
-        """Computes date/datetime statistics matching ydata-profiling,
+        fig.update_xaxes(title_text=col, row=1, col=1)
+        fig.update_yaxes(title_text="Frequency", row=1, col=1)
+        fig.update_xaxes(title_text=col, row=1, col=2)
+        fig.update_layout(bargap=0.02)
+        self._show_fig(fig, height=420)
 
-        displays the metrics tables, and plots a time-series histogram.
-        """
-        if col not in self.df.columns:
-            raise ValueError(f"Column '{col}' not found in DataFrame.")
+    # ------------------------------------------------------------------ #
+    # Univariate: date
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _parse_dates(s: pl.Series) -> pl.Series:
+        """Parse a column into Date/Datetime, turning unparseable values into null."""
+        if s.dtype == pl.Date or s.dtype == pl.Datetime:
+            return s
+        if s.dtype in (pl.String, pl.Categorical):
+            s = s.cast(pl.String)
+            best: pl.Series | None = None
+            for parse in (
+                lambda x: x.str.to_datetime(strict=False),
+                lambda x: x.str.to_date(strict=False),
+            ):
+                try:
+                    cand = parse(s)
+                except Exception:
+                    continue
+                if best is None or cand.null_count() < best.null_count():
+                    best = cand
+            if best is not None:
+                return best
+            return pl.Series(s.name, [None] * s.len(), dtype=pl.Datetime)
+        raise TypeError(
+            f"Column '{s.name}' has dtype {s.dtype}; expected Date, Datetime or String."
+        )
 
-        n = len(self.df)
-        original_col = self.df[col]
+    def date_univ(self, col: str) -> None:
+        """Date/datetime statistics and a time-series histogram."""
+        self._check_col(col)
 
-        # Safely parse column into datetimes, capturing invalid/NaT entries
-        parsed_dt = pd.to_datetime(original_col, errors="coerce")
-        invalid_count = original_col.notna().sum() - parsed_dt.notna().sum()
-        invalid_pct = (invalid_count / n * 100) if n > 0 else 0.0
+        n = self.df.height
+        s = self.df[col]
 
-        clean_s = parsed_dt.dropna()
+        parsed = self._parse_dates(s)
+        invalid_count = max(0, parsed.null_count() - s.null_count())
+        invalid_pct = _pct(invalid_count, n)
 
-        # --- 1. Calculate Metrics Matching Image ---
-        distinct = clean_s.nunique()
-        distinct_pct = (distinct / n * 100) if n > 0 else 0.0
+        clean = parsed.drop_nulls()
 
-        missing = original_col.isna().sum() + invalid_count
-        missing_pct = (missing / n * 100) if n > 0 else 0.0
+        # --- Metrics ---
+        distinct = clean.n_unique()
+        distinct_pct = _pct(distinct, n)
+        missing = s.null_count() + invalid_count
+        missing_pct = _pct(missing, n)
+        min_val = clean.min() if clean.len() else "-"
+        max_val = clean.max() if clean.len() else "-"
+        mem_str = _format_bytes(s.estimated_size())
 
-        min_val = clean_s.min() if not clean_s.empty else "-"
-        max_val = clean_s.max() if not clean_s.empty else "-"
-
-        # Memory size formatting
-        mem_bytes = original_col.memory_usage(deep=True)
-        if mem_bytes < 1024:
-            mem_str = f"{mem_bytes} B"
-        elif mem_bytes < 1024 * 1024:
-            mem_str = f"{mem_bytes / 1024:.1f} KiB"
-        else:
-            mem_str = f"{mem_bytes / (1024 * 1024):.1f} MiB"
-
-        # --- 2. Display Header and Tables ---
+        # --- Display ---
         display(Markdown(f"### **{col}**"))
         display(Markdown("*Date*"))
 
-        # Optional: Display 'Unique' badge if all valid values are distinct
-        if distinct == len(clean_s) and n > 0:
+        if clean.len() > 0 and distinct == clean.len() and n > 0:
             display(
                 Markdown(
                     "<span"
@@ -846,202 +1143,163 @@ class ProfileReport:
                 )
             )
 
-        # Left & Right metric mappings
-        left_metrics = {
-            "Distinct": distinct,
-            "Distinct (%)": f"{distinct_pct:.1f}%",
-            "Missing": missing,
-            "Missing (%)": f"{missing_pct:.1f}%",
-            "Memory size": mem_str,
-        }
-
-        right_metrics = {
-            "Minimum": str(min_val),
-            "Maximum": str(max_val),
-            "Invalid dates": invalid_count,
-            "Invalid dates (%)": f"{invalid_pct:.1f}%",
-        }
-
-        # Build side-by-side or stacked summary view
-        left_table = pd.DataFrame(
-            {
-                "Metric (Left)": list(left_metrics.keys()),
-                "Value (Left)": list(left_metrics.values()),
-            }
-        )
-        right_table = pd.DataFrame(
-            {
-                "Metric (Right)": list(right_metrics.keys()),
-                "Value (Right)": list(right_metrics.values()),
-            }
-        )
-
         display(Markdown("#### Overview statistics"))
-        display(left_table)
-        display(right_table)
+        self._show_table(
+            self._kv_table(
+                "Metric (Left)",
+                [
+                    ("Distinct", distinct),
+                    ("Distinct (%)", f"{distinct_pct:.1f}%"),
+                    ("Missing", missing),
+                    ("Missing (%)", f"{missing_pct:.1f}%"),
+                    ("Memory size", mem_str),
+                ],
+                value_name="Value (Left)",
+            )
+        )
+        self._show_table(
+            self._kv_table(
+                "Metric (Right)",
+                [
+                    ("Minimum", min_val),
+                    ("Maximum", max_val),
+                    ("Invalid dates", invalid_count),
+                    ("Invalid dates (%)", f"{invalid_pct:.1f}%"),
+                ],
+                value_name="Value (Right)",
+            )
+        )
 
-        # --- 3. Plotting Date Histogram ---
-        if not clean_s.empty:
-            plt.figure(figsize=(10, 4))
-            sns.histplot(x=parsed_dt, kde=False, color="dodgerblue", bins=50)
-            plt.title(f"Histogram of {col}", fontsize=14, fontweight="bold", pad=15)
-            plt.xlabel(col)
-            plt.ylabel("Frequency")
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            plt.show()
-        else:
+        # --- Histogram over time (binned in numpy; 50 bins) ---
+        if clean.is_empty():
             print(f"Warning: Column '{col}' contains no valid dates to plot.")
+            return
 
-    def categorical_univ(self, col: str):
-        """Computes categorical statistics matching ydata-profiling,
+        ts = clean.cast(pl.Datetime("us")).dt.epoch("us").to_numpy()
+        counts, edges = np.histogram(ts, bins=50)
+        to_dt = lambda a: np.round(a).astype("int64").astype("datetime64[us]")  # noqa: E731
+        centers = to_dt((edges[:-1] + edges[1:]) / 2)
+        width_ms = float(edges[1] - edges[0]) / 1000.0  # date-axis bar width is in ms
 
-        displays overview and common values tables, and plots both the frequency bar
-        chart and the segmented Common Values proportional bar plot.
-        """
-        if col not in self.df.columns:
-            raise ValueError(f"Column '{col}' not found in DataFrame.")
+        fig = go.Figure(
+            go.Bar(
+                x=centers,
+                y=counts,
+                width=width_ms,
+                marker_color="dodgerblue",
+                hovertemplate="%{x}<br>count=%{y}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            title=dict(text=f"<b>Histogram of {col}</b>"),
+            xaxis=dict(title=col, type="date", tickangle=-45),
+            yaxis_title="Frequency",
+            bargap=0.02,
+        )
+        self._show_fig(fig, height=400)
 
-        n = len(self.df)
-        original_col = self.df[col]
-        clean_s = original_col.dropna()
+    # ------------------------------------------------------------------ #
+    # Univariate: categorical
+    # ------------------------------------------------------------------ #
+    def categorical_univ(self, col: str) -> None:
+        """Overview + common values tables and a proportional stacked bar of the top 5 values."""
+        self._check_col(col)
 
-        # --- 1. Calculate Metrics ---
-        distinct = clean_s.nunique()
-        distinct_pct = (distinct / n * 100) if n > 0 else 0.0
+        n = self.df.height
+        s = self.df[col]
+        clean = self._clean(s)
 
-        missing = original_col.isna().sum()
-        missing_pct = (missing / n * 100) if n > 0 else 0.0
+        # --- Metrics ---
+        distinct = clean.n_unique()
+        distinct_pct = _pct(distinct, n)
+        missing = self._missing_count(s)
+        missing_pct = _pct(missing, n)
+        mem_str = _format_bytes(s.estimated_size())
 
-        # Memory size formatting
-        mem_bytes = original_col.memory_usage(deep=True)
-        if mem_bytes < 1024:
-            mem_str = f"{mem_bytes} B"
-        elif mem_bytes < 1024 * 1024:
-            mem_str = f"{mem_bytes / 1024:.1f} KiB"
-        else:
-            mem_str = f"{mem_bytes / (1024 * 1024):.1f} MiB"
+        total_valid = clean.len()
+        vc = clean.alias("value").value_counts(sort=True)
+        values = vc.get_column("value")
+        cnts = vc.get_column(vc.columns[-1])
 
-        val_counts = clean_s.value_counts()
-        val_freqs = clean_s.value_counts(normalize=True) * 100
-
-        # --- 2. Display Header and Overview Table ---
+        # --- Display ---
         display(Markdown(f"### **{col}**"))
         display(Markdown("*Categorical*"))
 
-        overview_metrics = {
-            "Distinct": distinct,
-            "Distinct (%)": f"{distinct_pct:.1f}%",
-            "Missing": missing,
-            "Missing (%)": f"{missing_pct:.1f}%",
-            "Memory size": mem_str,
-        }
-
-        overview_table = pd.DataFrame(
-            {
-                "Metric": list(overview_metrics.keys()),
-                "Value": list(overview_metrics.values()),
-            }
-        )
-
         display(Markdown("#### Overview statistics"))
-        display(overview_table)
-
-        # --- 3. Plotting Segmented "Common Values (Plot)" Bar Chart ---
-        if not clean_s.empty:
-            fig, ax = plt.subplots(figsize=(9, 3.5))
-
-            # Take top 5 categories for the proportional bar plot (matching standard profiles)
-            plot_data = val_counts.head(5)
-            total_valid = clean_s.count()
-
-            left = 0
-            colors = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b2"]
-
-            for i, (cat, count) in enumerate(plot_data.items()):
-                pct = (count / total_valid) * 100
-                width = count
-                color = colors[i % len(colors)]
-
-                ax.barh(
-                    0,
-                    width,
-                    left=left,
-                    color=color,
-                    label=str(cat),
-                    edgecolor="white",
-                    linewidth=1.5,
-                )
-
-                # Text inside bar segment
-                x_center = left + width / 2
-                ax.text(
-                    x_center,
-                    0,
-                    f"{pct:.1f}%\n({count})",
-                    ha="center",
-                    va="center",
-                    color="white",
-                    fontweight="bold",
-                    fontsize=11,
-                )
-
-                left += width
-
-            ax.set_yticks([])
-            ax.set_xticks([])
-            ax.set_title(
-                "Common Values (Plot)",
-                fontsize=14,
-                fontweight="bold",
-                loc="left",
-                pad=15,
+        self._show_table(
+            self._kv_table(
+                "Metric",
+                [
+                    ("Distinct", distinct),
+                    ("Distinct (%)", f"{distinct_pct:.1f}%"),
+                    ("Missing", missing),
+                    ("Missing (%)", f"{missing_pct:.1f}%"),
+                    ("Memory size", mem_str),
+                ],
             )
-
-            # Hide box spines
-            for spine in ax.spines.values():
-                spine.set_visible(False)
-
-            # Legend placed below
-            ax.legend(
-                loc="upper left",
-                bbox_to_anchor=(0.15, -0.15),
-                ncol=1,
-                frameon=True,
-                fontsize=12,
-            )
-            plt.tight_layout()
-            plt.show()
-
-        # --- 4. Common Values Table ---
-        display(Markdown("#### Common Values"))
-        common_values_df = pd.DataFrame(
-            {
-                "Value": val_counts.index,
-                "Count": val_counts.values,
-                "Frequency (%)": [f"{f:.1f}%" for f in val_freqs.values],
-            }
         )
 
-        display(common_values_df.head(10))
+        # --- Segmented "Common Values (Plot)" bar (top 5 categories) ---
+        if total_valid > 0:
+            colors = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b2"]
+            fig = go.Figure()
+            for i, (cat, count) in enumerate(
+                zip(values.head(5).to_list(), cnts.head(5).to_list())
+            ):
+                pct = count / total_valid * 100
+                fig.add_trace(
+                    go.Bar(
+                        x=[count],
+                        y=[""],
+                        orientation="h",
+                        name=str(cat),
+                        text=[f"{pct:.1f}%<br>({count})"],
+                        textposition="inside",
+                        insidetextanchor="middle",
+                        textfont=dict(color="white", size=13),
+                        marker=dict(
+                            color=colors[i % len(colors)],
+                            line=dict(color="white", width=1.5),
+                        ),
+                        hovertemplate=f"{cat}<br>{count} ({pct:.1f}%)<extra></extra>",
+                    )
+                )
+            fig.update_layout(
+                barmode="stack",
+                title=dict(text="<b>Common Values (Plot)</b>", x=0.0),
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+                legend=dict(orientation="h", yanchor="top", y=-0.05, x=0.0),
+            )
+            self._show_fig(fig, height=240)
 
-    def univ(self, col: str, col_type: str):
-        """Univariate analysis router function requiring an explicit col_type argument.
+        # --- Common values table ---
+        display(Markdown("#### Common Values"))
+        common_values_df = pl.DataFrame(
+            {
+                "Value": values,
+                "Count": cnts,
+                "Frequency (%)": [
+                    f"{c / total_valid * 100:.1f}%" for c in cnts.to_list()
+                ],
+            }
+        )
+        self._show_table(common_values_df.head(10))
 
-        Supported col_types: 'numeric', 'text', 'date', 'categorical' (with common
-        aliases).
+    # ------------------------------------------------------------------ #
+    # Router
+    # ------------------------------------------------------------------ #
+    def univ(self, col: str, col_type: str) -> None:
+        """Univariate analysis router requiring an explicit ``col_type``.
+
+        Supported col_types: 'numeric', 'text', 'date', 'categorical' (with
+        common aliases).
         """
-        # 1. Validate DataFrame input
-        if not isinstance(self.df, pd.DataFrame):
-            raise TypeError("Input 'df' must be a valid pandas DataFrame.")
-
-        # 2. Validate column existence
         if col not in self.df.columns:
             raise ValueError(
                 f"Column '{col}' does not exist in the provided DataFrame."
             )
 
-        # 3. Validate explicit col_type input
         if col_type is None:
             raise ValueError(
                 f"Missing required argument 'col_type' for column '{col}'. Please "
@@ -1050,7 +1308,6 @@ class ProfileReport:
 
         col_type_norm = str(col_type).lower().strip()
 
-        # 4. Route to the selected analysis method and report failures.
         try:
             if col_type_norm in ("numeric", "num", "int", "float"):
                 self.numeric_univ(col)
@@ -1072,4 +1329,4 @@ class ProfileReport:
                     f" as '{col_type}':** {str(e)}</span>"
                 )
             )
-            raise e
+            raise

@@ -4,24 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sinica"  # Rename to your preferred unique package name
-version = "0.1.4"
+version = "0.1.5"
 authors = [
   { name="sarvamm", email="srvmrtr@gmail.com" },
 ]
-description = "A pandas DataFrame profiling tool for statistical summaries and quality alerts."
+description = "A Polars DataFrame profiling tool with interactive Plotly summaries and quality alerts."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pandas>=1.2.0",
     "numpy>=1.20.0",
     "scipy>=1.6.0",
+    "polars>=1.0.0",
+    "plotly",
+    "ipython",
+    "nbformat",
+    "tqdm",
     "wordcloud>=1.9.2"
 ]
+
+[project.optional-dependencies]
+pandas = ["pandas>=1.2.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

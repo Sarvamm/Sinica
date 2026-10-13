@@ -2,9 +2,9 @@
 
 [![PyPI version](https://badge.fury.io/py/sinica.svg)](https://badge.fury.io/py/sinica)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Sinica** is a lightweight, fast, and intuitive Python data profiling tool built on top of `pandas`. It provides comprehensive statistical summaries and automated data quality alerts with zero bloated dependencies.
+**Sinica** is a lightweight Python data profiling tool built on `polars`, with optional `pandas` DataFrame input support. It provides statistical summaries, automated data quality alerts, and column-level analysis.
 
 ---
 
@@ -17,7 +17,7 @@
   - High cardinality & severe class imbalance
   - Skewed distributions & missing data percentages
   - Duplicate rows & empty dataset checks
-- ⚡ **Lightweight & Clean Output**: Returns clean, standard `pandas.DataFrame` objects that seamlessly integrate with your analytical workflows or reporting pipelines.
+- ⚡ **Polars-powered**: Returns `polars.DataFrame` summaries and alerts, while accepting `polars.DataFrame`, `polars.LazyFrame`, and (with the `pandas` extra installed) `pandas.DataFrame` inputs.
 
 ---
 
@@ -27,6 +27,12 @@ Install `sinica` directly from PyPI using `pip`:
 
 ```bash
 pip install sinica
+```
+
+To enable input conversion from pandas DataFrames, install the optional extra:
+
+```bash
+pip install "sinica[pandas]"
 ```
 
 #  Quick Start
@@ -42,13 +48,14 @@ df = your_data_frame
 # 2. Instantiate the ProfileReport
 pr = ProfileReport(df)
 
-# 3. Generate a statistical summary
-summary_df = pr.summary()
-print(summary_df)
+# 3. Simply run
+pr.show_overview()
 
-# 4. Extract data quality alerts
-alerts_df = pr.alerts()
-print(alerts_df)
+# 4. Generate a statistical summary
+pr.get_summary()
+
+# 5. Extract data quality alerts
+pr.get_alerts()
 ```
 
 ## Column-level analysis
@@ -61,3 +68,9 @@ Aliases such as `"num"`, `"str"`, `"datetime"`, and `"category"` are also accept
 pr.univ("age", "numeric")
 pr.univ("comment", "text")
 ```
+
+## Performance comparison
+
+The chart below compares median profiling times for Sinica and `fg-data-profiling` across the row counts shown. For Sinica, the benchmark includes summary and alert generation plus univariate analysis of every column. The tools perform different analyses, so these timings are an indicative end-to-end comparison rather than a feature-for-feature benchmark. Results vary with hardware, data, package versions, and configuration.
+
+![Median profiling time by row count: Sinica compared with fg-data-profiling](comparison.png)
