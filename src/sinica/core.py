@@ -82,7 +82,7 @@ class ProfileReport:
     # Max points sent to the browser for box plots (histograms are binned in
     # numpy, so they always use all of the data).
     MAX_PLOT_POINTS: int = 50_000
-    PLOT_TEMPLATE: str = "plotly_white"
+    PLOT_TEMPLATE: str = "plotly_dark"
 
     @staticmethod
     def _from_pandas(pdf: "pd.DataFrame") -> pl.DataFrame:
@@ -385,19 +385,38 @@ class ProfileReport:
                 if clean.len() > 0:
                     f = clean.cast(pl.Float64)
                     row.update(
-                        mean=_nan_to_none(_num(f.mean())),
-                        std=_nan_to_none(_num(f.std())),
-                        min=_nan_to_none(_num(f.min())),
-                        median=_nan_to_none(_num(f.median())),
-                        max=_nan_to_none(_num(f.max())),
+                        mean=_nan_to_none(round(_num(f.mean()), 2)),
+                        std=_nan_to_none(round(_num(f.std()), 2)),
+                        min=_nan_to_none(round(_num(f.min()), 2)),
+                        median=_nan_to_none(round(_num(f.median()), 2)),
+                        max=_nan_to_none(round(_num(f.max()), 2)),
                     )
             else:
                 row["top"], row["freq"] = self._top_value(clean)
 
             rows.append(row)
 
-        self.summary_df = pl.DataFrame(rows, schema=schema).sort(
-            "dtype", maintain_order=True
+        feature_names = [row["column"] for row in rows]
+        summary_rows = []
+        for statistic in schema:
+            values = {}
+            for row in rows:
+                value = row[statistic]
+                values[row["column"]] = (
+                    None
+                    if value is None
+                    else f"{value:.2f}"
+                    if isinstance(value, float)
+                    else str(value)
+                )
+            summary_rows.append({"Statistic": statistic, **values})
+
+        self.summary_df = pl.DataFrame(
+            summary_rows,
+            schema={
+                "Statistic": pl.String,
+                **{name: pl.String for name in feature_names},
+            },
         )
 
     def _compute_missing_analysis(self) -> None:
@@ -479,7 +498,7 @@ class ProfileReport:
                 y=labels,
                 zmin=-1,
                 zmax=1,
-                colorscale="RdBu_r",
+                colorscale="magma",
                 texttemplate="%{z:.2f}",
                 hoverongaps=False,
                 colorbar=dict(title="r"),
